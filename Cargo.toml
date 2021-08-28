@@ -1,0 +1,11 @@
+[package]
+name = "atomic_deque"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+parking_lot = "0.11.1"
+hushed_panic = { path = "../hushed_panic" }
+patient_waiter = { path = "../patient_waiter" }
