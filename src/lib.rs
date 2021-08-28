@@ -4,6 +4,8 @@ use std::fmt::{Debug, Formatter};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::thread::ThreadId;
+use std::sync::mpsc::Sender;
 
 // Free for the taking!
 const FLAGS_FREE: u8 = 0b00;
@@ -735,14 +737,8 @@ impl<T: Debug, const N: usize> AtomicDeque<T, N> {
     // only wait if there are no more items in the list, and a notification would
     // only be fired if someone were to return an item, however that cannot be
     // done without acquiring the first_taken_state lock.
-    pub fn next_wait(&self) -> Link<T> {
-        while let Err(_) =
-            self.first_locked
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        {
-            // std::hint::spin_loop();
-        }
-
+    pub fn next_wait(&self, tx: &Sender<FirstLockEvent>) -> Link<T> {
+        self.lock_first(&tx);
 
         match self
             .len
@@ -751,17 +747,10 @@ impl<T: Debug, const N: usize> AtomicDeque<T, N> {
             Ok(_) => {}
             Err(_) => unsafe {
                 self.patient_waiter.wait_until(
-                    || self.first_locked.store(false, Ordering::Relaxed),
+                    || self.unlock_first(&tx),
                     || self.len.load(Ordering::Relaxed) > 0,
                     || {
-                        while let Err(_) = self.first_locked.compare_exchange(
-                            false,
-                            true,
-                            Ordering::Acquire,
-                            Ordering::Relaxed,
-                        ) {
-                            // std::hint::spin_loop();
-                        }
+                        self.lock_first(&tx);
                         if self
                             .len
                             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
@@ -783,62 +772,54 @@ impl<T: Debug, const N: usize> AtomicDeque<T, N> {
             self.first.store(post, Ordering::SeqCst);
         });
 
-        self.first_locked.store(false, Ordering::Relaxed);
+        self.unlock_first(&tx);
         result.unwrap()
     }
 
-    pub fn next_try(&self) -> Option<Link<T>> {
-        while let Err(_) =
-            self.first_locked
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        {
-            // std::hint::spin_loop();
-        }
+    // pub fn next_try(&self) -> Option<Link<T>> {
+    //     self.lock_first();
+    //
+    //     if let Err(_) = self
+    //         .len
+    //         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_sub(1))
+    //     {
+    //         self.unlock_first();
+    //         return None;
+    //     }
+    //
+    //     let first = self.first.load(Ordering::Relaxed);
+    //     let result = remove(first, &self.items, |_, post| {
+    //         self.first.store(post, Ordering::SeqCst)
+    //     });
+    //     self.unlock_first();
+    //     result
+    // }
 
-        if let Err(_) = self
-            .len
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_sub(1))
-        {
-            self.first_locked.store(false, Ordering::Relaxed);
-            return None;
-        }
+    // fn next_try_prelocked(&self) -> Option<Link<T>> {
+    //     if let Err(_) =
+    //         self.first_locked
+    //             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+    //     {
+    //         return None;
+    //     }
+    //
+    //     if let Err(_) = self
+    //         .len
+    //         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_sub(1))
+    //     {
+    //         panic!("Invalid state!");
+    //     }
+    //
+    //     let first = self.first.load(Ordering::Relaxed);
+    //     let result = remove_prelocked(first, &self.items, |_, post| {
+    //         self.first.store(post, Ordering::SeqCst)
+    //     });
+    //     self.unlock_first();
+    //     result
+    // }
 
-        let first = self.first.load(Ordering::Relaxed);
-        let result = remove(first, &self.items, |_, post| {
-            self.first.store(post, Ordering::SeqCst)
-        });
-        self.first_locked.store(false, Ordering::Relaxed);
-        result
-    }
-
-    fn next_try_prelocked(&self) -> Option<Link<T>> {
-        if let Err(_) =
-            self.first_locked
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        {
-            return None;
-        }
-
-        if let Err(_) = self
-            .len
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_sub(1))
-        {
-            panic!("Invalid state!");
-        }
-
-        let first = self.first.load(Ordering::Relaxed);
-        let result = remove_prelocked(first, &self.items, |_, post| {
-            self.first.store(post, Ordering::SeqCst)
-        });
-        self.first_locked.store(false, Ordering::Relaxed);
-        result
-    }
-
-    pub fn deposit(&self, link: Link<T>) {
-        while let Err(_) =
-        self.first_locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        {}
+    pub fn deposit(&self, link: Link<T>, tx: &Sender<FirstLockEvent>) {
+        self.lock_first(&tx);
 
         if self.len.load(Ordering::Relaxed) == 0 {
             let index = link.index;
@@ -846,13 +827,8 @@ impl<T: Debug, const N: usize> AtomicDeque<T, N> {
             write_into(&self.items[index], link);
 
             self.first.store(index, Ordering::Relaxed);
-
-            self
-                .first_locked
-                .compare_exchange(true, false, Ordering::Release, Ordering::Relaxed)
-                .unwrap();
         } else {
-            insert_after(self.first.load(Ordering::Relaxed), &self.items, link).expect("Invalid state!");
+            insert_after(self.first.load(Ordering::Relaxed), &self.items, link).unwrap_or_else(|_| panic!("Invalid state! {:#?}", &self.items));
         }
 
         self
@@ -863,87 +839,126 @@ impl<T: Debug, const N: usize> AtomicDeque<T, N> {
             .notify();
         self.patient_waiter
             .notify();
+
+        self.unlock_first(&tx);
     }
 
-    pub fn predicate_next_wait(&self, mut pred: impl FnMut(&T, usize) -> bool) -> Option<Link<T>> {
-        let mut checked_count = 0;
-
-        #[derive(Copy, Clone)]
-        enum ItemState {
-            False,
-            Queued,
-            Unchecked,
-        }
-
-        const INIT_VAL: Cell<ItemState> = Cell::new(ItemState::Unchecked);
-        let checked_idx = [INIT_VAL; N];
-
-        let mut token = self.counter_waiter.token();
-
-        loop {
-            for ((index, item), state) in self.items.iter().enumerate().zip(&checked_idx) {
-                match state.get() {
-                    ItemState::False => continue,
-                    ItemState::Unchecked => match inspect_upgrade(&*item, &self.items, |item| {
-                        if pred(item, index) {
-                            if index == self.first.load(Ordering::Relaxed) {
-                                UpgradeMode::LeaveLocked
-                            } else {
-                                UpgradeMode::Remove
-                            }
-                        } else {
-                            UpgradeMode::False
-                        }
-                    }) {
-                        InspectUpgradeResult::Success(x) => return Some(x),
-                        InspectUpgradeResult::BackOffOrMutex => state.set(ItemState::Queued),
-                        InspectUpgradeResult::CouldNotAcquireOne => {}
-                        InspectUpgradeResult::DidNotUpgrade => {
-                            checked_count += 1;
-                            state.set(ItemState::False)
-                        },
-                        InspectUpgradeResult::LeaveLocked => match self.next_try_prelocked() {
-                            Some(x) => return Some(x),
-                            None => state.set(ItemState::Queued),
-                        },
-                    },
-                    ItemState::Queued => {
-                        if index == self.first.load(Ordering::Relaxed) {
-                            match self.next_try() {
-                                Some(link) => {
-                                    if link.index == index {
-                                        return Some(link);
-                                    } else if let ItemState::Queued = checked_idx[index].get() {
-                                        return Some(link);
-                                    } else {
-                                        self.deposit(link);
-                                    }
-                                }
-                                None => {}
-                            }
-                        } else {
-                            match remove(index, &self.items, |_, _| {}) {
-                                Some(x) => return Some(x),
-                                None => {}
-                            }
-                        }
-                    }
-                }
-            }
-
-            if checked_count != N {
-                self.counter_waiter.wait(&mut token);
-            } else {
-                break;
-            }
-        }
-
-        None
-    }
+    // pub fn predicate_next_wait(&self, mut pred: impl FnMut(&T, usize) -> bool) -> Option<Link<T>> {
+    //     let mut checked_count = 0;
+    //
+    //     #[derive(Copy, Clone)]
+    //     enum ItemState {
+    //         False,
+    //         Queued,
+    //         Unchecked,
+    //     }
+    //
+    //     const INIT_VAL: Cell<ItemState> = Cell::new(ItemState::Unchecked);
+    //     let checked_idx = [INIT_VAL; N];
+    //
+    //     let mut token = self.counter_waiter.token();
+    //
+    //     loop {
+    //         for ((index, item), state) in self.items.iter().enumerate().zip(&checked_idx) {
+    //             match state.get() {
+    //                 ItemState::False => continue,
+    //                 ItemState::Unchecked => match inspect_upgrade(&*item, &self.items, |item| {
+    //                     if pred(item, index) {
+    //                         if index == self.first.load(Ordering::Relaxed) {
+    //                             UpgradeMode::LeaveLocked
+    //                         } else {
+    //                             UpgradeMode::Remove
+    //                         }
+    //                     } else {
+    //                         UpgradeMode::False
+    //                     }
+    //                 }) {
+    //                     InspectUpgradeResult::Success(x) => return Some(x),
+    //                     InspectUpgradeResult::BackOffOrMutex => state.set(ItemState::Queued),
+    //                     InspectUpgradeResult::CouldNotAcquireOne => {}
+    //                     InspectUpgradeResult::DidNotUpgrade => {
+    //                         checked_count += 1;
+    //                         state.set(ItemState::False)
+    //                     },
+    //                     InspectUpgradeResult::LeaveLocked => match self.next_try_prelocked() {
+    //                         Some(x) => return Some(x),
+    //                         None => state.set(ItemState::Queued),
+    //                     },
+    //                 },
+    //                 ItemState::Queued => {
+    //                     if index == self.first.load(Ordering::Relaxed) {
+    //                         match self.next_try() {
+    //                             Some(link) => {
+    //                                 if link.index == index {
+    //                                     return Some(link);
+    //                                 } else if let ItemState::Queued = checked_idx[index].get() {
+    //                                     return Some(link);
+    //                                 } else {
+    //                                     self.deposit(link);
+    //                                 }
+    //                             }
+    //                             None => {}
+    //                         }
+    //                     } else {
+    //                         match remove(index, &self.items, |_, _| {}) {
+    //                             Some(x) => return Some(x),
+    //                             None => {}
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //
+    //         if checked_count != N {
+    //             self.counter_waiter.wait(&mut token);
+    //         } else {
+    //             break;
+    //         }
+    //     }
+    //
+    //     None
+    // }
 
     pub fn len(&self) -> usize {
         self.len.load(Ordering::Relaxed)
     }
+
+    fn lock_first(&self, sender: &Sender<FirstLockEvent>) {
+        while let Err(_) =
+        self.first_locked
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+        {}
+        sender.send(
+            FirstLockEvent {
+                id: std::thread::current().id(),
+                now_locked: true,
+                count: COUNT.fetch_add(1, Ordering::SeqCst),
+            }
+        ).unwrap();
+    }
+
+    fn unlock_first(&self, sender: &Sender<FirstLockEvent>) {
+        self
+            .first_locked
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed)
+            .unwrap();
+        sender.send(
+            FirstLockEvent {
+                id: std::thread::current().id(),
+                now_locked: false,
+                count: COUNT.fetch_add(1, Ordering::SeqCst),
+            }
+        ).unwrap();
+    }
+}
+
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Copy, Clone)]
+pub struct FirstLockEvent {
+    id: ThreadId,
+    now_locked: bool,
+    count: usize,
 }
 
 // We do literally "give out" `T`, so this is the perfect opportunity
@@ -969,83 +984,87 @@ mod tests {
     use crate::AtomicDeque;
     use hushed_panic::hush_this_test;
     use std::sync::Arc;
+    use std::sync::mpsc::channel;
+    use std::collections::HashMap;
 
-    #[test]
-    fn it_works() {
-        let buffer = AtomicDeque::new([10usize]);
-
-        assert_eq!(buffer.len(), 1);
-
-        let next = buffer.next_try().unwrap();
-
-        assert_eq!(*next, 10);
-
-        assert_eq!(buffer.len(), 0);
-        buffer.deposit(next);
-        assert_eq!(buffer.len(), 1);
-    }
-
-    #[test]
-    fn filtered_take() {
-        let buffer = AtomicDeque::new([0, 1, 2, 3, 4]);
-
-        let a = buffer.predicate_next_wait(|x, _| x % 2 == 1).unwrap();
-        let b = buffer.predicate_next_wait(|x, _| x % 2 == 1).unwrap();
-
-        assert_eq!(*a, 1);
-        assert_eq!(*b, 3);
-
-        buffer.deposit(a);
-
-        buffer.deposit(b);
-
-        let c = buffer.predicate_next_wait(|x, _| x % 2 == 1).unwrap();
-        assert_eq!(*c, 1);
-    }
-
-    #[test]
-    #[should_panic]
-    fn zero_items() {
-        let _x = hush_this_test();
-        AtomicDeque::new([(); 0]);
-    }
-
-    #[test]
-    #[should_panic]
-    fn deposit_overflow() {
-        let _x = hush_this_test();
-        let buffer_1 = AtomicDeque::new([10usize, 30]);
-        let buffer_2 = AtomicDeque::new([10usize]);
-
-        let link = buffer_2.next_wait();
-        buffer_1.deposit(link);
-    }
-
-    #[test]
-    #[should_panic]
-    fn not_taken() {
-        let _x = hush_this_test();
-        let buffer_1 = AtomicDeque::new([10usize, 30]);
-        let buffer_2 = AtomicDeque::new([10usize, 20]);
-
-        let _link1 = buffer_2.next_wait();
-        let link2 = buffer_2.next_wait();
-        let _link3 = buffer_1.next_wait();
-
-        buffer_1.deposit(link2);
-    }
+    // #[test]
+    // fn it_works() {
+    //     let buffer = AtomicDeque::new([10usize]);
+    //
+    //     assert_eq!(buffer.len(), 1);
+    //
+    //     let next = buffer.next_try().unwrap();
+    //
+    //     assert_eq!(*next, 10);
+    //
+    //     assert_eq!(buffer.len(), 0);
+    //     buffer.deposit(next);
+    //     assert_eq!(buffer.len(), 1);
+    // }
+    //
+    // #[test]
+    // fn filtered_take() {
+    //     let buffer = AtomicDeque::new([0, 1, 2, 3, 4]);
+    //
+    //     let a = buffer.predicate_next_wait(|x, _| x % 2 == 1).unwrap();
+    //     let b = buffer.predicate_next_wait(|x, _| x % 2 == 1).unwrap();
+    //
+    //     assert_eq!(*a, 1);
+    //     assert_eq!(*b, 3);
+    //
+    //     buffer.deposit(a);
+    //
+    //     buffer.deposit(b);
+    //
+    //     let c = buffer.predicate_next_wait(|x, _| x % 2 == 1).unwrap();
+    //     assert_eq!(*c, 1);
+    // }
+    //
+    // #[test]
+    // #[should_panic]
+    // fn zero_items() {
+    //     let _x = hush_this_test();
+    //     AtomicDeque::new([(); 0]);
+    // }
+    //
+    // #[test]
+    // #[should_panic]
+    // fn deposit_overflow() {
+    //     let _x = hush_this_test();
+    //     let buffer_1 = AtomicDeque::new([10usize, 30]);
+    //     let buffer_2 = AtomicDeque::new([10usize]);
+    //
+    //     let link = buffer_2.next_wait();
+    //     buffer_1.deposit(link);
+    // }
+    //
+    // #[test]
+    // #[should_panic]
+    // fn not_taken() {
+    //     let _x = hush_this_test();
+    //     let buffer_1 = AtomicDeque::new([10usize, 30]);
+    //     let buffer_2 = AtomicDeque::new([10usize, 20]);
+    //
+    //     let _link1 = buffer_2.next_wait();
+    //     let link2 = buffer_2.next_wait();
+    //     let _link3 = buffer_1.next_wait();
+    //
+    //     buffer_1.deposit(link2);
+    // }
 
     #[test]
     fn stress_test() {
         let buffer = Arc::new(AtomicDeque::new([(); 3]));
-        let handles = (0..6)
+        let (tx, rx) = channel();
+        let mut handles = (0..50)
             .map(|_| {
                 let buffer = buffer.clone();
+                let tx = tx.clone();
                 std::thread::spawn(move || {
-                    for _ in 0..100 {
-                        buffer.deposit(buffer.next_wait());
+                    let id = std::thread::current().id();
+                    for _ in 0..500 {
+                        buffer.deposit(buffer.next_wait(&tx), &tx);
                     }
-                    println!("Done!");
                 })
             })
             .collect::<Vec<_>>();
