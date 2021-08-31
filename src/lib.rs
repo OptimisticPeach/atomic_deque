@@ -1,9 +1,10 @@
-use patient_waiter::{CountingWaiter, PatientWaiter, ValidateResult};
+use patient_waiter::ValidateResult;
 use std::cell::{UnsafeCell, Cell};
 use std::fmt::{Debug, Formatter};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use patient_waiter::counting_waiter::CountingWaiter;
 
 // Free for the taking!
 const FLAGS_FREE: u8 = 0b00;
@@ -709,8 +710,7 @@ pub struct AtomicDeque<T, const N: usize> {
     first: AtomicUsize,
     first_locked: AtomicBool,
     len: AtomicUsize,
-    patient_waiter: PatientWaiter,
-    counter_waiter: CountingWaiter,
+    waiter: CountingWaiter,
 }
 
 impl<T: Debug, const N: usize> AtomicDeque<T, N> {
@@ -727,8 +727,7 @@ impl<T: Debug, const N: usize> AtomicDeque<T, N> {
             first: AtomicUsize::new(0),
             first_locked: AtomicBool::new(false),
             len: AtomicUsize::new(N),
-            patient_waiter: PatientWaiter::new(),
-            counter_waiter: CountingWaiter::new(),
+            waiter: CountingWaiter::new(),
         }
     }
 
@@ -745,7 +744,7 @@ impl<T: Debug, const N: usize> AtomicDeque<T, N> {
         {
             Ok(_) => {}
             Err(_) => unsafe {
-                self.patient_waiter.wait_until(
+                self.waiter.wait_hooked_until(
                     || self.unlock_first(),
                     || self.len.load(Ordering::Relaxed) > 0,
                     || {
@@ -834,12 +833,8 @@ impl<T: Debug, const N: usize> AtomicDeque<T, N> {
             .len
             .fetch_add(1, Ordering::Relaxed);
 
-        self.counter_waiter
-            .notify();
-        self.patient_waiter
-            .notify();
-
-        self.unlock_first();
+        self.waiter
+            .notify_one();
     }
 
     pub fn predicate_next_wait(&self, mut pred: impl FnMut(&T, usize) -> bool) -> Option<Link<T>> {
@@ -855,7 +850,7 @@ impl<T: Debug, const N: usize> AtomicDeque<T, N> {
         const INIT_VAL: Cell<ItemState> = Cell::new(ItemState::Unchecked);
         let checked_idx = [INIT_VAL; N];
 
-        let mut token = self.counter_waiter.token();
+        let mut token = self.waiter.token();
 
         loop {
             for ((index, item), state) in self.items.iter().enumerate().zip(&checked_idx) {
@@ -909,7 +904,7 @@ impl<T: Debug, const N: usize> AtomicDeque<T, N> {
             }
 
             if checked_count != N {
-                self.counter_waiter.wait(&mut token);
+                self.waiter.wait_token(&mut token);
             } else {
                 break;
             }
@@ -928,28 +923,13 @@ impl<T: Debug, const N: usize> AtomicDeque<T, N> {
         self.first_locked
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
         {}
-        // sender.send(
-        //     FirstLockEvent {
-        //         id: std::thread::current().id(),
-        //         now_locked: true,
-        //         count: COUNT.fetch_add(1, Ordering::SeqCst),
-        //     }
-        // ).unwrap();
     }
 
-    // fn unlock_first(&self, sender: &Sender<FirstLockEvent>) {
     fn unlock_first(&self) {
         self
             .first_locked
             .compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed)
             .unwrap();
-        // sender.send(
-        //     FirstLockEvent {
-        //         id: std::thread::current().id(),
-        //         now_locked: false,
-        //         count: COUNT.fetch_add(1, Ordering::SeqCst),
-        //     }
-        // ).unwrap();
     }
 }
 
